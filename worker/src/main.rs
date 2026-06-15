@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::{Read, BufRead, BufReader};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::sync::mpsc;
@@ -308,6 +308,7 @@ fn worker_thread_loop(
     task_rx: mpsc::Receiver<(u128, u64)>,
     result_tx: mpsc::Sender<(u128, DerivedKeys, String, u64, u64)>,
     keep_running: Arc<AtomicBool>,
+    progress: Arc<AtomicU64>,
 ) {
     let secp = Secp256k1::new();
     
@@ -351,6 +352,8 @@ fn worker_thread_loop(
                     }
                 }
             }
+            // Incrementa il progresso una volta completato il chunk
+            progress.fetch_add(count, Ordering::Relaxed);
         } else {
             // Nessun compito ricevuto, verifica se dobbiamo uscire
             if !keep_running.load(Ordering::Relaxed) {
@@ -388,6 +391,8 @@ fn main() {
     let mut thread_senders = Vec::new();
     let (result_tx, result_rx) = mpsc::channel();
 
+    let progress_counter = Arc::new(AtomicU64::new(0));
+
     // Avvio dei thread worker
     for i in 0..args.threads {
         let (task_tx, task_rx) = mpsc::channel();
@@ -396,9 +401,10 @@ fn main() {
         let filter_clone = Arc::clone(&bloom_filter);
         let result_tx_clone = result_tx.clone();
         let keep_running_clone = Arc::clone(&keep_running);
+        let progress_clone = Arc::clone(&progress_counter);
         
         thread::spawn(move || {
-            worker_thread_loop(i, filter_clone, task_rx, result_tx_clone, keep_running_clone);
+            worker_thread_loop(i, filter_clone, task_rx, result_tx_clone, keep_running_clone, progress_clone);
         });
     }
 
@@ -459,6 +465,7 @@ fn main() {
 
         println!("[Job] Ricevuto range: #{} a #{} (totale: {} chiavi)", start_key, start_key + count as u128 - 1, count);
         let start_time = Instant::now();
+        progress_counter.store(0, Ordering::Relaxed);
 
         // 2. Suddividi il range nei thread worker (invia come compiti da 10.000 chiavi a rotazione)
         let chunk_size = 10000u64;
@@ -476,11 +483,10 @@ fn main() {
             thread_idx = (thread_idx + 1) % args.threads;
         }
 
-        // 3. Attendi il tempo stimato monitorando periodicamente se è stato trovato qualcosa
-        let check_interval = Duration::from_millis(200);
-        let mut elapsed = start_time.elapsed();
+        // 3. Attendi il completamento monitorando periodicamente progressi e risultati
+        let check_interval = Duration::from_millis(100);
         
-        while elapsed < Duration::from_secs(100) && keep_running.load(Ordering::Relaxed) {
+        while keep_running.load(Ordering::Relaxed) {
             // Controlla se i thread hanno trovato una chiave con saldo reale
             if let Ok((found_key, derived, addr_type, balance, txs)) = result_rx.recv_timeout(check_interval) {
                 // Abbiamo trovato qualcosa!
@@ -531,7 +537,10 @@ fn main() {
                 break;
             }
 
-            elapsed = start_time.elapsed();
+            // Verifica se tutto il blocco è stato scansionato dai thread
+            if progress_counter.load(Ordering::Relaxed) >= count {
+                break;
+            }
         }
 
         // 4. Se tutto il blocco è stato completato con successo (senza vincite)
