@@ -3,6 +3,7 @@ import sys
 import math
 import struct
 import time
+import gzip
 
 def fnv1a_64(data: bytes) -> int:
     """Hash rapido FNV-1a a 64 bit."""
@@ -73,8 +74,8 @@ class BloomFilter:
 
 def main():
     if len(sys.argv) < 2:
-        print("Uso: python generator.py <file_indirizzi.txt> [n_elementi_attesi] [p_falsi_positivi]")
-        print("Esempio: python generator.py utxo_addresses.txt 80000000 0.000001")
+        print("Uso: python generator.py <file_indirizzi.txt o .gz> [n_elementi_attesi] [p_falsi_positivi]")
+        print("Esempio: python generator.py blockchair_bitcoin_addresses_and_balance_LATEST.tsv.gz 80000000 0.000001")
         sys.exit(1)
 
     input_file = sys.argv[1]
@@ -93,11 +94,32 @@ def main():
     # 1. Inizializza il Bloom Filter
     bf = BloomFilter(n, p)
     
-    # 2. Legge il file riga per riga (streaming)
+    # 2. Rileva se il file è compresso (.gz)
+    is_gzip = input_file.endswith(".gz")
+    open_func = gzip.open if is_gzip else open
+    mode = "rt" if is_gzip else "r"
+    
+    # 3. Legge il file riga per riga (streaming)
     count = 0
-    with open(input_file, "r", encoding="utf-8") as f:
+    skipped_headers = 0
+    
+    with open_func(input_file, mode, encoding="utf-8") as f:
         for line in f:
-            address = line.strip()
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Se la riga contiene una tabulazione, assumiamo sia in formato TSV (address \t balance)
+            if "\t" in line:
+                parts = line.split("\t")
+                address = parts[0].strip()
+                # Salta l'intestazione se presente (es. "address")
+                if address.lower() == "address":
+                    skipped_headers += 1
+                    continue
+            else:
+                address = line
+                
             if address:
                 bf.add(address.encode("utf-8"))
                 count += 1
@@ -106,12 +128,12 @@ def main():
                     speed = count / elapsed if elapsed > 0 else 0
                     print(f"Elaborati {count} indirizzi... Velocità: {speed:.0f} ind/sec")
 
-    # 3. Salva su disco
+    # 4. Salva su disco
     output_filename = "filter.bin"
     bf.save_to_file(output_filename)
     
     total_time = time.time() - start_time
-    print(f"Fatto! Inseriti {count} indirizzi in {total_time:.2f} secondi.")
+    print(f"Fatto! Inseriti {count} indirizzi (saltate {skipped_headers} intestazioni) in {total_time:.2f} secondi.")
     print(f"File generato: '{output_filename}' ({os.path.getsize(output_filename) / (1024*1024):.2f} MB)")
 
 if __name__ == "__main__":
