@@ -1,46 +1,54 @@
-# 🚀 Guida di Avvio Rapido del Worker (Hyperion Project)
+# 🚀 Guida di Scansione Distribuita (Hyperion Project)
 
-Questa cartella è pensata per ospitare tutto il necessario per avviare il client di ricerca (worker) in modo indipendente, sia sul PC principale che su macchine esterne dedicate.
-
----
-
-## 📦 File Necessari per il Funzionamento
-Per far funzionare il worker sono richiesti esattamente **3 file** in questa cartella:
-
-1. **`hyperion_worker.exe`**: L'eseguibile compilato in Rust del worker.
-2. **`filter.bin`**: Il database Bloom Filter binario contenente tutti gli indirizzi Bitcoin attivi con saldo positivo.
-3. **`Avvia_Worker.cmd`**: Lo script batch interattivo per avviare il processo di scansione.
+Questa guida spiega come configurare ed avviare il sistema distribuito di ricerca chiavi, composto dal **Server Coordinator** (centrale) e dai **Worker** (client di elaborazione Rust).
 
 ---
 
-## 🛠️ Come Preparare la Cartella sul PC Principale
-Se hai appena clonato il repository sul tuo computer principale, segui questi passaggi per popolare la cartella `Workers`:
+## 📋 Flusso di Lavoro in 3 Passaggi
 
-1. **Compila il Worker (Rust):**
-   Apri un terminale nella cartella `worker` ed esegui la compilazione ottimizzata in modalità release:
+Per iniziare la ricerca, i passaggi devono essere eseguiti in questo ordine:
+
+### 1️⃣ Avviare il Server Coordinator (sul PC Principale)
+Il server coordinator deve essere sempre attivo prima di lanciare i worker, in modo da poter distribuire i blocchi di lavoro.
+1. Apri la cartella del server coordinator: `D:\GitHub\Distributed_BTC_Key_Search\`
+2. Fai doppio clic su **`Avvia_Server.cmd`**.
+3. Il server si avvierà in ascolto sulla porta **8085** e rimarrà in attesa dei client. Lascia la finestra aperta.
+
+### 2️⃣ Generare il Bloom Filter `filter.bin` (sul PC Principale)
+Il worker ha bisogno del database compresso per fare i controlli offline ad altissima velocità.
+1. Scarica il dump aggiornato da Loyce.club (file `.tsv.gz` con i saldi attivi, es. `blockchair_bitcoin_addresses_and_balance_LATEST.tsv.gz`).
+2. Posiziona il file scaricato nella cartella `generator` di questo progetto: `D:\GitHub\Hyperion_Project\generator\`
+3. Apri il terminale in quella cartella e genera il filtro:
+   ```cmd
+   python generator.py blockchair_bitcoin_addresses_and_balance_LATEST.tsv.gz 80000000 0.000001
+   ```
+4. Lo script produrrà un file `filter.bin` da circa 274 MB.
+
+### 3️⃣ Avviare i Worker (Client Rust)
+Una volta che il coordinator è attivo e il file `filter.bin` è pronto, puoi lanciare i worker.
+
+#### A. Sul PC Principale (stesso computer del server)
+1. Vai nella cartella `D:\GitHub\Hyperion_Project\Workers\`.
+2. Fai doppio clic su **`Avvia_Worker.cmd`**.
+3. Alla prima esecuzione, lo script copierà automaticamente `hyperion_worker.exe` (compilato da Rust in `worker/target/release/`) e il file `filter.bin` (dal generatore) in questa cartella.
+4. Quando ti viene chiesto l'IP del coordinator, premi semplicemente **Invio** (utilizzerà `127.0.0.1`).
+
+#### B. Su PC Esterni (Macchine remote)
+1. Copia l'intera cartella **`Workers`** (che ora contiene `hyperion_worker.exe`, `filter.bin` e `Avvia_Worker.cmd`) su una chiavetta USB o tramite rete e incollala sul PC esterno.
+2. Fai doppio clic su **`Avvia_Worker.cmd`** sul PC esterno.
+3. Inserisci i parametri richiesti:
+   * **IP/Hostname del Server:** L'IP locale del PC principale (es. `192.168.1.50` o il nome host del computer).
+   * **Thread CPU:** Il numero di core CPU da dedicare alla scansione (es. `4`, `8`, `12`).
+   * **Worker ID:** Un nome per identificare la macchina (es. `PC-Portatile`). Invio per usare il nome di Windows.
+
+---
+
+## 🛠️ Compilazione manuale del Worker (Se modifichi il codice Rust)
+Se apporti modifiche al codice sorgente in Rust (`worker/src/main.rs`) e hai bisogno di ricompilare l'eseguibile:
+1. Apri il terminale nella cartella `worker` ed esegui la compilazione ottimizzata in modalità release:
    ```cmd
    cd worker
    cargo build --release
    ```
-2. **Genera il Bloom Filter reale (`filter.bin`):**
-   Scarica il dump degli indirizzi attivi da Loyce.club (es. `blockchair_bitcoin_addresses_and_balance_LATEST.tsv.gz`), salvalo nella cartella `generator` ed esegui:
-   ```cmd
-   cd generator
-   python generator.py blockchair_bitcoin_addresses_and_balance_LATEST.tsv.gz 80000000 0.000001
-   ```
-3. **Popolamento Automatico:**
-   Fai semplicemente doppio clic su **`Avvia_Worker.cmd`** in questa cartella (`Workers\`). Lo script rileverà l'eseguibile compilato in `worker/target/release/` e il file `filter.bin` generato in `generator/` e **li copierà automaticamente qui dentro**, rendendo la cartella pronta ed indipendente.
+2. Lo script `Avvia_Worker.cmd` rileverà la nuova build e aggiornerà l'eseguibile nella cartella `Workers` al successivo avvio.
 
----
-
-## 💻 Come Eseguire su PC Esterni (Stand-alone)
-Per distribuire la computazione su altri PC Windows senza dover installare Rust, Python o scaricare l'intero codice sorgente:
-
-1. Copia l'intera cartella **`Workers`** (che ora contiene `hyperion_worker.exe`, `filter.bin` e `Avvia_Worker.cmd`) su una chiavetta USB o inviala tramite rete al PC di destinazione.
-2. Sul PC di destinazione, apri la cartella e fai doppio clic su **`Avvia_Worker.cmd`**.
-3. Inserisci le informazioni richieste:
-   * **IP/Hostname del Server Coordinator:** L'indirizzo IP locale del tuo PC principale (es. `192.168.1.50` o il nome host come `desktop-casa-giuse`). Il coordinator deve essere in esecuzione sulla porta `8085`.
-   * **Numero di Thread:** Il numero di core CPU che desideri dedicare alla scansione (es. `4`, `8`, `12`).
-   * **ID del Worker:** Un nome univoco per identificare la macchina (es. `PC-Portatile`, `PC-Ufficio`). Premendo semplicemente Invio verrà usato il nome del computer di Windows.
-
-Il worker scaricherà automaticamente i range di chiavi dal server coordinator principale, verificherà le chiavi generate in locale a grandissima velocità e riporterà i risultati in tempo reale.
