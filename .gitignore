@@ -4,6 +4,12 @@
 # file binari generati
 *.bin
 
+# dump compressi e grandi dataset
+*.gz
+*.tsv
+*.txt
+
 # file di test temporanei
 /generator/test_addresses.txt
 /worker/target/release/filter.bin
+
