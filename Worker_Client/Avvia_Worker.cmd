@@ -46,13 +46,17 @@ if "%FILTER_PATH%"=="" (
     exit /b 1
 )
 
-:: 3. Copia file necessari in locale se non presenti
+:: 3. Copia file necessari in locale se non presenti o aggiornati
 if not exist "filter.bin" (
     echo Copia del Bloom Filter [%FILTER_PATH%] in corso...
     copy "%FILTER_PATH%" "filter.bin" > nul
 )
 
-if not exist "hyperion_worker.exe" (
+if exist "..\worker\target\release\hyperion_worker.exe" (
+    echo Aggiornamento/Copia di hyperion_worker.exe da target/release...
+    copy /y "..\worker\target\release\hyperion_worker.exe" "hyperion_worker.exe" > nul
+    set EXE_PATH=hyperion_worker.exe
+) else if not exist "hyperion_worker.exe" (
     echo Copia del Worker [%EXE_PATH%] in corso...
     copy "%EXE_PATH%" "hyperion_worker.exe" > nul
     set EXE_PATH=hyperion_worker.exe
