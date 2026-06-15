@@ -1,0 +1,9 @@
+# Compilazione Rust
+/worker/target/
+
+# file binari generati
+*.bin
+
+# file di test temporanei
+/generator/test_addresses.txt
+/worker/target/release/filter.bin
