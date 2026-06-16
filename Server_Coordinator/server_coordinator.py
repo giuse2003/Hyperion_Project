@@ -31,7 +31,11 @@ def get_completion_percentage(checked_keys):
     pct = (Decimal(checked_keys) / TOTAL_KEYS) * 100
     if pct == 0:
         return "0.0%"
-    return f"{pct:.6e}%"
+    # Mostra in formato decimale fisso fino a 85 cifre decimali per evitare la notazione scientifica
+    formatted = f"{pct:.85f}".rstrip('0')
+    if formatted.endswith('.'):
+        formatted += '0'
+    return f"{formatted}%"
 
 # Stato Globale in memoria
 server_state = {
