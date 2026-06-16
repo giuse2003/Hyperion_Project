@@ -13,3 +13,10 @@
 /generator/test_addresses.txt
 /worker/target/release/filter.bin
 
+# Stato locale del Server Coordinator, log e file temporanei
+/Server_Coordinator/checkpoint.json
+/Server_Coordinator/checkpoint.json.tmp
+/Server_Coordinator/risultati.json
+/Server_Coordinator/app.log
+/Server_Coordinator/*.log
+/Server_Coordinator/*.tmp
