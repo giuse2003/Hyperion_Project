@@ -86,7 +86,7 @@ Dove:
 
 ### 5. Roadmap di Sviluppo Proposta
 
-*   **Fase 1**: Script di generazione del Bloom Filter a partire da un file CSV/testo di indirizzi attivi.
-*   **Fase 2**: Riscrittura del Worker Client in **Rust** (CPU bound) con supporto per il Bloom Filter locale.
-*   **Fase 3**: Aggiornamento del Server Coordinator per ospitare il file binario del Bloom Filter e sincronizzare i worker.
-*   **Fase 4 (Opzionale)**: Integrazione di codice CUDA in Rust per consentire l'uso opzionale della scheda video (GPU) per una velocità di scansione strabiliante.
+*   **Fase 1 (Completata)**: Script di generazione del Bloom Filter a partire da un file CSV/testo di indirizzi attivi (con estrazione payload a 20-byte).
+*   **Fase 2 (Completata)**: Riscrittura del Worker Client in **Rust** (CPU bound) con supporto per il Bloom Filter locale.
+*   **Fase 3 (Completata)**: Aggiornamento del Server Coordinator per ospitare il file binario del Bloom Filter e gestire blocchi scalabili.
+*   **Fase 4 (Completata)**: Integrazione di codice **OpenCL** in Rust per accelerazione cross-platform (NVIDIA/AMD) automatica su GPU, con gestione ottimizzata dei blocchi massivi (50+ milioni di chiavi) e fallback su CPU manuale tramite parametro `--cpu`.

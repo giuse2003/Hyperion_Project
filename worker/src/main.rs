@@ -226,6 +226,9 @@ struct Args {
 
     #[arg(long, default_value_t = 4)]
     threads: usize,
+
+    #[arg(long)]
+    cpu: bool, // Forza l'uso esclusivo della CPU
 }
 
 #[derive(Deserialize, Debug)]
@@ -375,7 +378,37 @@ fn main() {
     println!("=== HYPERION WORKER RUST STARTED ===");
     println!("Coordinator: {}", coordinator_url);
     println!("Worker ID: {}", worker_id);
-    println!("Threads: {}", args.threads);
+    println!("Threads CPU: {}", args.threads);
+    println!("Modalità GPU: {}", if args.cpu { "DISABILITATA MANUALMENTE" } else { "AUTOMATICA (Default)" });
+
+    let mut block_size = 100000u64; // Default CPU
+    
+    if !args.cpu {
+        println!("\n=== INIZIALIZZAZIONE OPENCL GPU ===");
+        match opencl3::platform::get_platforms() {
+            Ok(platforms) if !platforms.is_empty() => {
+                let mut gpu_found = false;
+                for platform in platforms {
+                    println!("Piattaforma: {}", platform.name().unwrap_or_default());
+                    if let Ok(devices) = platform.get_devices(opencl3::device::CL_DEVICE_TYPE_GPU) {
+                        for device_id in devices {
+                            let device = opencl3::device::Device::new(device_id);
+                            println!("- Device GPU trovato: {}", device.name().unwrap_or_default());
+                            gpu_found = true;
+                        }
+                    }
+                }
+                if gpu_found {
+                    println!("GPU rilevata correttamente! Imposto block_size = 50.000.000 per alleviare il coordinator.");
+                    block_size = 50000000u64;
+                } else {
+                    println!("Nessuna scheda video idonea trovata. Switch automatico alla modalità CPU!");
+                }
+            }
+            _ => println!("OpenCL non disponibile nel sistema. Switch automatico alla modalità CPU!"),
+        }
+        println!("===================================\n");
+    }
 
     // Carica il Bloom Filter
     let filter_path = "filter.bin";
@@ -419,7 +452,7 @@ fn main() {
 
     while keep_running.load(Ordering::Relaxed) {
         // 1. Chiedi un blocco di lavoro al Coordinator
-        let work_url = format!("{}/request_work?worker_id={}", coordinator_url, worker_id);
+        let work_url = format!("{}/request_work?worker_id={}&count={}", coordinator_url, worker_id, block_size);
         println!("[Network] Richiesta blocco di lavoro...");
         
         let mut job: Option<WorkResponse> = None;
