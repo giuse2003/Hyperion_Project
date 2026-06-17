@@ -1,7 +1,7 @@
 use std::fs::File;
-use std::io::{Read, BufRead, BufReader};
+use std::io::Read;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // --- Moduli Crittografici ---
 use ripemd::{Digest as RipeDigest, Ripemd160};
 use secp256k1::{PublicKey, Secp256k1, SecretKey};
-use sha2::{Digest as ShaDigest, Sha256};
+use sha2::Sha256;
 
 // --- Hashing FNV-1a a 64 bit (uguale a generator.py) ---
 fn fnv1a_64(data: &[u8]) -> u64 {
@@ -447,8 +447,6 @@ fn main() {
         println!("\nSegnale di interruzione rilevato (Ctrl+C). Arresto del worker...");
         keep_running_ctrlc.store(false, Ordering::Relaxed);
     }).expect("Errore nell'impostare il gestore Ctrl+C");
-
-    let mut current_offset = 0u64;
 
     while keep_running.load(Ordering::Relaxed) {
         // 1. Chiedi un blocco di lavoro al Coordinator
