@@ -225,8 +225,8 @@ struct Args {
     #[arg(long)]
     worker_id: Option<String>,
 
-    #[arg(long, default_value_t = 4)]
-    threads: usize,
+    #[arg(long)]
+    threads: Option<usize>,
 
     #[arg(long)]
     cpu: bool, // Forza l'uso esclusivo della CPU
@@ -243,6 +243,7 @@ struct WorkResponse {
 #[derive(Serialize, Debug)]
 struct ReportCompleted {
     worker_id: String,
+    start_key: String,
     count: u64,
 }
 
@@ -379,7 +380,11 @@ fn main() {
     println!("=== HYPERION WORKER RUST STARTED ===");
     println!("Coordinator: {}", coordinator_url);
     println!("Worker ID: {}", worker_id);
-    println!("Threads CPU: {}", args.threads);
+    let num_threads = args.threads.unwrap_or_else(|| {
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+    });
+    
+    println!("Threads CPU: {}", num_threads);
     println!("Modalità GPU: {}", if args.cpu { "DISABILITATA MANUALMENTE" } else { "AUTOMATICA (Default)" });
 
     let mut block_size = 100000u64; // Default CPU
@@ -414,7 +419,7 @@ fn main() {
                 }
                 if let Some(device_id) = chosen_device {
                     println!("GPU rilevata correttamente! Preparazione Grid Method...");
-                    block_size = 8388608u64;
+                    block_size = 50331648u64;
                     
                     let context = opencl3::context::Context::from_device(&opencl3::device::Device::new(device_id)).expect("Creazione context fallita");
                     let queue = opencl3::command_queue::CommandQueue::create_default(&context, 0).expect("Creazione command queue fallita");
@@ -431,13 +436,13 @@ fn main() {
                     let output_count = unsafe { opencl3::memory::Buffer::<u32>::create(&context, opencl3::memory::CL_MEM_READ_WRITE, 1, std::ptr::null_mut()).unwrap() };
                     
                     let row_size = 8192usize;
-                    let batch_size = 8388608usize;
-                    let col_size = batch_size / row_size;
+                    let batch_size = 50331648u64;
+                    let col_size = (batch_size / (row_size as u64)) as usize;
                     
                     let row_in = unsafe { opencl3::memory::Buffer::<u32>::create(&context, opencl3::memory::CL_MEM_READ_ONLY, row_size * 16, std::ptr::null_mut()).unwrap() };
                     let mut col_in = unsafe { opencl3::memory::Buffer::<u32>::create(&context, opencl3::memory::CL_MEM_READ_ONLY, col_size * 16, std::ptr::null_mut()).unwrap() };
-                    let mut points_out = unsafe { opencl3::memory::Buffer::<u32>::create(&context, opencl3::memory::CL_MEM_READ_WRITE, batch_size * 16, std::ptr::null_mut()).unwrap() };
-                    let mut z_heap = unsafe { opencl3::memory::Buffer::<u32>::create(&context, opencl3::memory::CL_MEM_READ_WRITE, batch_size * 2 * 8, std::ptr::null_mut()).unwrap() };
+                    let mut points_out = unsafe { opencl3::memory::Buffer::<u32>::create(&context, opencl3::memory::CL_MEM_READ_WRITE, (batch_size as usize) * 16, std::ptr::null_mut()).unwrap() };
+                    let mut z_heap = unsafe { opencl3::memory::Buffer::<u32>::create(&context, opencl3::memory::CL_MEM_READ_WRITE, (batch_size as usize) * 2 * 8, std::ptr::null_mut()).unwrap() };
                     
                     println!("Precalcolo punti Row...");
                     let secp = secp256k1::Secp256k1::new();
@@ -488,7 +493,7 @@ fn main() {
     let progress_counter = Arc::new(AtomicU64::new(0));
 
     // Avvio dei thread worker
-    for i in 0..args.threads {
+    for i in 0..num_threads {
         let (task_tx, task_rx) = mpsc::channel();
         thread_senders.push(task_tx);
         
@@ -600,12 +605,12 @@ fn main() {
                     .set_arg(z_heap)
                     .set_arg(row_in)
                     .set_arg(col_in)
-                    .set_global_work_sizes(&[8192, 1024])
+                    .set_global_work_sizes(&[row_size, col_size])
                     .set_local_work_sizes(&[64, 1])
                     .enqueue_nd_range(queue).unwrap();
                     
                 let invsize = 256i32;
-                let invws = (8388608usize / (invsize as usize)) as usize;
+                let invws = (50331648usize / (invsize as usize)) as usize;
                 ExecuteKernel::new(kernel_invert)
                     .set_arg(z_heap)
                     .set_arg(&invsize)
@@ -624,7 +629,7 @@ fn main() {
                     .set_arg(&max_outputs)
                     .set_arg(&start_key_high)
                     .set_arg(&start_key_low)
-                    .set_global_work_sizes(&[8192, 1024])
+                    .set_global_work_sizes(&[row_size, col_size])
                     .set_local_work_sizes(&[64, 1])
                     .enqueue_nd_range(queue).unwrap();
                     
@@ -645,22 +650,16 @@ fn main() {
                     println!("Chiave Privata possibilmente valida: #{}", hit_key);
                     println!("=======================================================");
                     // La CPU si occuperà di verificare questa specifica chiave derivandola a mano
+                    // Abbiamo un "hit" del Bloom Filter dalla GPU.
+                    // Evitiamo di fare 3 richieste HTTP bloccanti per ogni falso positivo,
+                    // altrimenti la CPU frena la GPU. Stampiamo solo gli indirizzi generati:
                     let derived = derive_addresses(&secp, hit_key);
-                    if let Some((balance, txs)) = check_address_online(&derived.legacy_addr) {
-                        if balance > 0 || txs > 0 {
-                            let _ = result_tx.send((hit_key, derived.clone(), "legacy".to_string(), balance, txs));
-                        }
-                    }
-                    if let Some((balance, txs)) = check_address_online(&derived.nested_addr) {
-                        if balance > 0 || txs > 0 {
-                            let _ = result_tx.send((hit_key, derived.clone(), "nested".to_string(), balance, txs));
-                        }
-                    }
-                    if let Some((balance, txs)) = check_address_online(&derived.native_addr) {
-                        if balance > 0 || txs > 0 {
-                            let _ = result_tx.send((hit_key, derived.clone(), "native".to_string(), balance, txs));
-                        }
-                    }
+                    println!("    Legacy: {}", derived.legacy_addr);
+                    println!("    Nested: {}", derived.nested_addr);
+                    println!("    Native: {}", derived.native_addr);
+                    
+                    // Se vuoi che il coordinator se ne occupi, potresti scommentare qui:
+                    // let _ = result_tx.send((hit_key, derived.clone(), "legacy".to_string(), 0, 0));
                 }
             }
             progress_counter.store(count, Ordering::Relaxed);
@@ -678,7 +677,7 @@ fn main() {
                 let _ = thread_senders[thread_idx].send((chunk_start_key, current_chunk_size));
                 
                 sent_count += current_chunk_size;
-                thread_idx = (thread_idx + 1) % args.threads;
+                thread_idx = (thread_idx + 1) % num_threads;
             }
         }
 
@@ -752,6 +751,7 @@ fn main() {
             let completed_url = format!("{}/report_completed", coordinator_url);
             let report_data = ReportCompleted {
                 worker_id: worker_id.clone(),
+                start_key: start_key.to_string(),
                 count,
             };
             let _ = ureq::post(&completed_url).send_json(&report_data);

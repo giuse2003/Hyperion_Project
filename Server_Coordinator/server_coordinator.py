@@ -22,6 +22,7 @@ CHECKPOINT_FILE = "checkpoint.json"
 RESULTS_FILE = "risultati.json"
 PORT = 8085
 BLOCK_SIZE = 100000  # Dimensione di default del blocco di chiavi da scansionare
+BLOCK_TIMEOUT_SECONDS = 15  # Timeout dopo il quale un blocco viene riassegnato
 
 # Ordine della curva secp256k1 (N) meno 1 (chiave 0 non valida)
 TOTAL_KEYS = Decimal("115792089237316195423570985008687907852837564279074904382605163141518161494337")
@@ -41,7 +42,8 @@ def get_completion_percentage(checked_keys):
 server_state = {
     "next_private_key_number": 1,
     "checked_keys": 0,
-    "stop_flag": False
+    "stop_flag": False,
+    "pending_blocks": {}
 }
 
 # --- File Writing helpers (resilient to locks) ---
@@ -63,6 +65,7 @@ def save_checkpoint_on_disk():
         "last_completed_private_key_number": str(server_state["next_private_key_number"] - 1),
         "next_private_key_number": str(server_state["next_private_key_number"]),
         "checked_keys": str(server_state["checked_keys"]),
+        "pending_blocks": server_state["pending_blocks"],
         "updated_at": datetime.datetime.now().isoformat()
     }
     safe_write_json(CHECKPOINT_FILE, checkpoint)
@@ -73,6 +76,7 @@ def load_checkpoint_from_disk():
             "last_completed_private_key_number": "0",
             "next_private_key_number": "1",
             "checked_keys": "0",
+            "pending_blocks": {},
             "updated_at": None
         }
         safe_write_json(CHECKPOINT_FILE, checkpoint)
@@ -80,13 +84,17 @@ def load_checkpoint_from_disk():
     
     try:
         with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            if "pending_blocks" not in data:
+                data["pending_blocks"] = {}
+            return data
     except Exception as e:
         logging.error(f"Errore di lettura checkpoint: {e}. Ne creo uno nuovo.")
         checkpoint = {
             "last_completed_private_key_number": "0",
             "next_private_key_number": "1",
             "checked_keys": "0",
+            "pending_blocks": {},
             "updated_at": None
         }
         safe_write_json(CHECKPOINT_FILE, checkpoint)
@@ -138,12 +146,33 @@ class CoordinatorHandler(BaseHTTPRequestHandler):
                 except ValueError:
                     pass
 
-            # Assegna il blocco di lavoro
-            start_key = server_state["next_private_key_number"]
-            server_state["next_private_key_number"] += requested_count
-            save_checkpoint_on_disk()
+            # Controllo se ci sono blocchi scaduti da riassegnare
+            assigned_block = None
+            current_time = time.time()
+            worker_id = query.get("worker_id", ["unknown"])[0] if "worker_id" in query else "unknown"
             
-            logging.info(f"Assegnato blocco da #{start_key} a #{start_key + requested_count - 1} ({requested_count} chiavi)")
+            for key_start, block_info in list(server_state["pending_blocks"].items()):
+                if current_time - block_info["assigned_at"] > BLOCK_TIMEOUT_SECONDS:
+                    assigned_block = (int(key_start), block_info["count"])
+                    block_info["assigned_at"] = current_time
+                    block_info["worker_id"] = worker_id
+                    break
+            
+            if assigned_block:
+                start_key, requested_count = assigned_block
+                logging.info(f"Riassegnato blocco SCADUTO da #{start_key} a #{start_key + requested_count - 1} a worker {worker_id}")
+            else:
+                # Assegna un nuovo blocco di lavoro
+                start_key = server_state["next_private_key_number"]
+                server_state["next_private_key_number"] += requested_count
+                server_state["pending_blocks"][str(start_key)] = {
+                    "count": requested_count,
+                    "worker_id": worker_id,
+                    "assigned_at": current_time
+                }
+                logging.info(f"Assegnato nuovo blocco da #{start_key} a #{start_key + requested_count - 1} ({requested_count} chiavi)")
+            
+            save_checkpoint_on_disk()
             
             self.send_json(200, {
                 "status": "ok",
@@ -182,11 +211,16 @@ class CoordinatorHandler(BaseHTTPRequestHandler):
         # 1. Endpoint: /report_completed
         if self.path == "/report_completed":
             count = int(payload.get("count", 0))
+            start_key = payload.get("start_key")
+            
+            if start_key and str(start_key) in server_state["pending_blocks"]:
+                del server_state["pending_blocks"][str(start_key)]
+                
             server_state["checked_keys"] += count
             save_checkpoint_on_disk()
             pct_checked = get_completion_percentage(server_state["checked_keys"])
             pct_scanned = get_completion_percentage(server_state["next_private_key_number"] - 1)
-            logging.info(f"Worker {payload.get('worker_id', 'unknown')} ha completato un blocco di {count} chiavi. Totale verificate: {server_state['checked_keys']} ({pct_checked}) | Range scansionato: {server_state['next_private_key_number'] - 1} ({pct_scanned})")
+            logging.info(f"Worker {payload.get('worker_id', 'unknown')} ha completato il blocco da #{start_key} ({count} chiavi). Totale verificate: {server_state['checked_keys']} ({pct_checked})")
             self.send_json(200, {"status": "acknowledged"})
             return
 
@@ -231,6 +265,7 @@ def main():
     
     server_state["next_private_key_number"] = int(checkpoint["next_private_key_number"])
     server_state["checked_keys"] = int(checkpoint["checked_keys"])
+    server_state["pending_blocks"] = checkpoint.get("pending_blocks", {})
     
     pct_checked = get_completion_percentage(server_state["checked_keys"])
     pct_scanned = get_completion_percentage(server_state["next_private_key_number"] - 1)
