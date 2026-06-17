@@ -106,6 +106,7 @@ fn hash160(data: &[u8]) -> Vec<u8> {
     rip.finalize().to_vec()
 }
 
+#[derive(Clone)]
 struct DerivedKeys {
     wif: String,
     legacy_addr: String,
@@ -383,33 +384,6 @@ fn main() {
 
     let mut block_size = 100000u64; // Default CPU
     
-    if !args.cpu {
-        println!("\n=== INIZIALIZZAZIONE OPENCL GPU ===");
-        match opencl3::platform::get_platforms() {
-            Ok(platforms) if !platforms.is_empty() => {
-                let mut gpu_found = false;
-                for platform in platforms {
-                    println!("Piattaforma: {}", platform.name().unwrap_or_default());
-                    if let Ok(devices) = platform.get_devices(opencl3::device::CL_DEVICE_TYPE_GPU) {
-                        for device_id in devices {
-                            let device = opencl3::device::Device::new(device_id);
-                            println!("- Device GPU trovato: {}", device.name().unwrap_or_default());
-                            gpu_found = true;
-                        }
-                    }
-                }
-                if gpu_found {
-                    println!("GPU rilevata correttamente! Imposto block_size = 50.000.000 per alleviare il coordinator.");
-                    block_size = 50000000u64;
-                } else {
-                    println!("Nessuna scheda video idonea trovata. Switch automatico alla modalità CPU!");
-                }
-            }
-            _ => println!("OpenCL non disponibile nel sistema. Switch automatico alla modalità CPU!"),
-        }
-        println!("===================================\n");
-    }
-
     // Carica il Bloom Filter
     let filter_path = "filter.bin";
     if !Path::new(filter_path).exists() {
@@ -418,6 +392,93 @@ fn main() {
     }
 
     let bloom_filter = Arc::new(BloomFilterLoader::load_from_file(filter_path).unwrap());
+
+    // Inizializza OpenCL se abilitato
+    let mut gpu_context = None;
+
+    if !args.cpu {
+        println!("\n=== INIZIALIZZAZIONE OPENCL GPU ===");
+        match opencl3::platform::get_platforms() {
+            Ok(platforms) if !platforms.is_empty() => {
+                let mut chosen_device = None;
+                for platform in platforms {
+                    println!("Piattaforma: {}", platform.name().unwrap_or_default());
+                    if let Ok(devices) = platform.get_devices(opencl3::device::CL_DEVICE_TYPE_GPU) {
+                        if let Some(&device_id) = devices.first() {
+                            let device = opencl3::device::Device::new(device_id);
+                            println!("- Device GPU trovato: {}", device.name().unwrap_or_default());
+                            chosen_device = Some(device_id);
+                            break;
+                        }
+                    }
+                }
+                if let Some(device_id) = chosen_device {
+                    println!("GPU rilevata correttamente! Preparazione Grid Method...");
+                    block_size = 8388608u64;
+                    
+                    let context = opencl3::context::Context::from_device(&opencl3::device::Device::new(device_id)).expect("Creazione context fallita");
+                    let queue = opencl3::command_queue::CommandQueue::create_default(&context, 0).expect("Creazione command queue fallita");
+                    let program_src = include_str!("hyperion_kernel.cl");
+                    let program = opencl3::program::Program::create_and_build_from_source(&context, program_src, "").expect("Compilazione kernel OpenCL fallita!");
+                    let kernel_add = opencl3::kernel::Kernel::create(&program, "ec_add_grid").expect("Creazione kernel_add fallita");
+                    let kernel_invert = opencl3::kernel::Kernel::create(&program, "heap_invert").expect("Creazione kernel_invert fallita");
+                    let kernel_bloom = opencl3::kernel::Kernel::create(&program, "hash_ec_point_bloom").expect("Creazione kernel_bloom fallita");
+                    
+                    let mut filter_buffer = unsafe { opencl3::memory::Buffer::<u8>::create(&context, opencl3::memory::CL_MEM_READ_ONLY, bloom_filter.bit_array.len(), std::ptr::null_mut()).unwrap() };
+                    let _ = unsafe { queue.enqueue_write_buffer(&mut filter_buffer, opencl3::command_queue::CL_BLOCKING, 0, &bloom_filter.bit_array, &[]).unwrap() };
+                    
+                    let output_buffer = unsafe { opencl3::memory::Buffer::<u64>::create(&context, opencl3::memory::CL_MEM_READ_WRITE, 100 * 2, std::ptr::null_mut()).unwrap() };
+                    let output_count = unsafe { opencl3::memory::Buffer::<u32>::create(&context, opencl3::memory::CL_MEM_READ_WRITE, 1, std::ptr::null_mut()).unwrap() };
+                    
+                    let row_size = 8192usize;
+                    let batch_size = 8388608usize;
+                    let col_size = batch_size / row_size;
+                    
+                    let row_in = unsafe { opencl3::memory::Buffer::<u32>::create(&context, opencl3::memory::CL_MEM_READ_ONLY, row_size * 16, std::ptr::null_mut()).unwrap() };
+                    let mut col_in = unsafe { opencl3::memory::Buffer::<u32>::create(&context, opencl3::memory::CL_MEM_READ_ONLY, col_size * 16, std::ptr::null_mut()).unwrap() };
+                    let mut points_out = unsafe { opencl3::memory::Buffer::<u32>::create(&context, opencl3::memory::CL_MEM_READ_WRITE, batch_size * 16, std::ptr::null_mut()).unwrap() };
+                    let mut z_heap = unsafe { opencl3::memory::Buffer::<u32>::create(&context, opencl3::memory::CL_MEM_READ_WRITE, batch_size * 2 * 8, std::ptr::null_mut()).unwrap() };
+                    
+                    println!("Precalcolo punti Row...");
+                    let secp = secp256k1::Secp256k1::new();
+                    let mut packed_row = vec![0u32; row_size * 16];
+                    let bundle_size = 1024usize;
+                    let stride = bundle_size / 8;
+                    
+                    for cell in 0..row_size {
+                        let mut priv_bytes = [0u8; 32];
+                        let key_bytes = ((cell as u128) + 1).to_be_bytes();
+                        priv_bytes[16..32].copy_from_slice(&key_bytes);
+                        let priv_key = secp256k1::SecretKey::from_slice(&priv_bytes).unwrap();
+                        let pub_key = secp256k1::PublicKey::from_secret_key(&secp, &priv_key);
+                        let serialized = pub_key.serialize_uncompressed();
+                        
+                        let mut px = [0u32; 8];
+                        let mut py = [0u32; 8];
+                        for i in 0..8 {
+                            let ox = 33 - (i + 1) * 4;
+                            px[i] = ((serialized[ox] as u32) << 24) | ((serialized[ox+1] as u32) << 16) | ((serialized[ox+2] as u32) << 8) | (serialized[ox+3] as u32);
+                            let oy = 65 - (i + 1) * 4;
+                            py[i] = ((serialized[oy] as u32) << 24) | ((serialized[oy+1] as u32) << 16) | ((serialized[oy+2] as u32) << 8) | (serialized[oy+3] as u32);
+                        }
+                        
+                        let mut start = (((2 * cell) / stride) * bundle_size) + (cell % (stride / 2));
+                        for i in 0..8 { packed_row[start + i * stride] = px[i]; }
+                        start += stride / 2;
+                        for i in 0..8 { packed_row[start + i * stride] = py[i]; }
+                    }
+                    let mut row_in_mut = row_in;
+                    let _ = unsafe { queue.enqueue_write_buffer(&mut row_in_mut, opencl3::command_queue::CL_BLOCKING, 0, &packed_row, &[]).unwrap() };
+                    
+                    gpu_context = Some((context, queue, kernel_add, kernel_invert, kernel_bloom, filter_buffer, output_buffer, output_count, row_in_mut, col_in, points_out, z_heap, secp));
+                } else {
+                    println!("Nessuna scheda video idonea trovata. Switch automatico alla modalità CPU!");
+                }
+            }
+            _ => println!("OpenCL non disponibile nel sistema. Switch automatico alla modalità CPU!"),
+        }
+        println!("===================================\n");
+    }
     let keep_running = Arc::new(AtomicBool::new(true));
 
     // Canali per inviare i task ai thread ed i risultati al main thread
@@ -498,20 +559,127 @@ fn main() {
         let start_time = Instant::now();
         progress_counter.store(0, Ordering::Relaxed);
 
-        // 2. Suddividi il range nei thread worker (invia come compiti da 10.000 chiavi a rotazione)
-        let chunk_size = 10000u64;
-        let mut sent_count = 0u64;
-        let mut thread_idx = 0;
+        if let Some((_, ref queue, ref kernel_add, ref kernel_invert, ref kernel_bloom, ref filter_buffer, ref mut output_buffer, ref mut output_count, ref row_in, ref mut col_in, ref mut points_out, ref mut z_heap, ref secp)) = gpu_context {
+            let start_key_high = (start_key >> 64) as u64;
+            let start_key_low = (start_key & 0xFFFFFFFFFFFFFFFF) as u64;
+            let m_bits = bloom_filter.m as u32;
+            let k_hashes = bloom_filter.k as u32;
+            let max_outputs = 100u32;
+            let zero = [0u32; 1];
+            
+            let col_size = 1024usize;
+            let row_size = 8192usize;
+            let mut col_points = Vec::with_capacity(col_size * 16);
+            for y in 0..col_size {
+                let key = start_key + (y as u128) * (row_size as u128) - 1;
+                let mut priv_bytes = [0u8; 32];
+                let key_bytes = key.to_be_bytes();
+                priv_bytes[16..32].copy_from_slice(&key_bytes);
+                let priv_key = secp256k1::SecretKey::from_slice(&priv_bytes).unwrap();
+                let pub_key = secp256k1::PublicKey::from_secret_key(secp, &priv_key);
+                let serialized = pub_key.serialize_uncompressed();
+                
+                for i in 0..8 {
+                    let ox = 33 - (i + 1) * 4;
+                    col_points.push(((serialized[ox] as u32) << 24) | ((serialized[ox+1] as u32) << 16) | ((serialized[ox+2] as u32) << 8) | (serialized[ox+3] as u32));
+                }
+                for i in 0..8 {
+                    let oy = 65 - (i + 1) * 4;
+                    col_points.push(((serialized[oy] as u32) << 24) | ((serialized[oy+1] as u32) << 16) | ((serialized[oy+2] as u32) << 8) | (serialized[oy+3] as u32));
+                }
+            }
+            
+            let mut hits_count = [0u32; 1];
+            unsafe {
+                queue.enqueue_write_buffer(output_count, opencl3::command_queue::CL_BLOCKING, 0, &zero, &[]).unwrap();
+                queue.enqueue_write_buffer(col_in, opencl3::command_queue::CL_BLOCKING, 0, &col_points, &[]).unwrap();
+                
+                use opencl3::kernel::ExecuteKernel;
+                ExecuteKernel::new(kernel_add)
+                    .set_arg(points_out)
+                    .set_arg(z_heap)
+                    .set_arg(row_in)
+                    .set_arg(col_in)
+                    .set_global_work_sizes(&[8192, 1024])
+                    .set_local_work_sizes(&[64, 1])
+                    .enqueue_nd_range(queue).unwrap();
+                    
+                let invsize = 256i32;
+                let invws = (8388608usize / (invsize as usize)) as usize;
+                ExecuteKernel::new(kernel_invert)
+                    .set_arg(z_heap)
+                    .set_arg(&invsize)
+                    .set_global_work_size(invws)
+                    .set_local_work_size(64)
+                    .enqueue_nd_range(queue).unwrap();
+                    
+                ExecuteKernel::new(kernel_bloom)
+                    .set_arg(output_buffer)
+                    .set_arg(output_count)
+                    .set_arg(points_out)
+                    .set_arg(z_heap)
+                    .set_arg(filter_buffer)
+                    .set_arg(&m_bits)
+                    .set_arg(&k_hashes)
+                    .set_arg(&max_outputs)
+                    .set_arg(&start_key_high)
+                    .set_arg(&start_key_low)
+                    .set_global_work_sizes(&[8192, 1024])
+                    .set_local_work_sizes(&[64, 1])
+                    .enqueue_nd_range(queue).unwrap();
+                    
+                queue.finish().unwrap();
+                
+                queue.enqueue_read_buffer(output_count, opencl3::command_queue::CL_BLOCKING, 0, &mut hits_count, &[]).unwrap();
+            }
+            
+            if hits_count[0] > 0 {
+                let mut hits = vec![0u64; (hits_count[0] * 2) as usize];
+                unsafe { queue.enqueue_read_buffer(output_buffer, opencl3::command_queue::CL_BLOCKING, 0, &mut hits, &[]).unwrap(); }
+                for i in 0..hits_count[0] {
+                    let hit_high = hits[(i * 2) as usize];
+                    let hit_low = hits[(i * 2 + 1) as usize];
+                    let hit_key = ((hit_high as u128) << 64) | (hit_low as u128);
+                    println!("=======================================================");
+                    println!("!!! HIT GPU RILEVATO DALLA SCHEDA VIDEO !!!");
+                    println!("Chiave Privata possibilmente valida: #{}", hit_key);
+                    println!("=======================================================");
+                    // La CPU si occuperà di verificare questa specifica chiave derivandola a mano
+                    let derived = derive_addresses(&secp, hit_key);
+                    if let Some((balance, txs)) = check_address_online(&derived.legacy_addr) {
+                        if balance > 0 || txs > 0 {
+                            let _ = result_tx.send((hit_key, derived.clone(), "legacy".to_string(), balance, txs));
+                        }
+                    }
+                    if let Some((balance, txs)) = check_address_online(&derived.nested_addr) {
+                        if balance > 0 || txs > 0 {
+                            let _ = result_tx.send((hit_key, derived.clone(), "nested".to_string(), balance, txs));
+                        }
+                    }
+                    if let Some((balance, txs)) = check_address_online(&derived.native_addr) {
+                        if balance > 0 || txs > 0 {
+                            let _ = result_tx.send((hit_key, derived.clone(), "native".to_string(), balance, txs));
+                        }
+                    }
+                }
+            }
+            progress_counter.store(count, Ordering::Relaxed);
+        } else {
+            // 2. Suddividi il range nei thread worker (invia come compiti da 10.000 chiavi a rotazione)
+            let chunk_size = 10000u64;
+            let mut sent_count = 0u64;
+            let mut thread_idx = 0;
 
-        while sent_count < count && keep_running.load(Ordering::Relaxed) {
-            let current_chunk_size = std::cmp::min(chunk_size, count - sent_count);
-            let chunk_start_key = start_key + sent_count as u128;
-            
-            // Invia il task al thread corrente a rotazione round-robin
-            let _ = thread_senders[thread_idx].send((chunk_start_key, current_chunk_size));
-            
-            sent_count += current_chunk_size;
-            thread_idx = (thread_idx + 1) % args.threads;
+            while sent_count < count && keep_running.load(Ordering::Relaxed) {
+                let current_chunk_size = std::cmp::min(chunk_size, count - sent_count);
+                let chunk_start_key = start_key + sent_count as u128;
+                
+                // Invia il task al thread corrente a rotazione round-robin
+                let _ = thread_senders[thread_idx].send((chunk_start_key, current_chunk_size));
+                
+                sent_count += current_chunk_size;
+                thread_idx = (thread_idx + 1) % args.threads;
+            }
         }
 
         // 3. Attendi il completamento monitorando periodicamente progressi e risultati
