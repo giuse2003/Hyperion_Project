@@ -1,2 +1,5 @@
 [target.x86_64-pc-windows-gnu]
 rustflags = ["-L", "./opencl_lib"]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-L", "./opencl_lib"]
