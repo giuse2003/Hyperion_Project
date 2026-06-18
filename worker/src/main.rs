@@ -230,6 +230,9 @@ struct Args {
 
     #[arg(long)]
     cpu: bool, // Forza l'uso esclusivo della CPU
+
+    #[arg(long)]
+    batch_size: Option<u64>, // Dimensione personalizzabile del blocco GPU
 }
 
 #[derive(Deserialize, Debug)]
@@ -387,6 +390,9 @@ fn main() {
     println!("Threads CPU: {}", num_threads);
     println!("Modalità GPU: {}", if args.cpu { "DISABILITATA MANUALMENTE" } else { "AUTOMATICA (Default)" });
 
+    let config_batch_size = args.batch_size.unwrap_or(8388608u64);
+    println!("Batch Size GPU configurato: {}", config_batch_size);
+
     let mut block_size = 100000u64; // Default CPU
     
     // Carica il Bloom Filter
@@ -436,7 +442,7 @@ fn main() {
                     let output_count = unsafe { opencl3::memory::Buffer::<u32>::create(&context, opencl3::memory::CL_MEM_READ_WRITE, 1, std::ptr::null_mut()).unwrap() };
                     
                     let row_size = 8192usize;
-                    let batch_size = 8388608u64;
+                    let batch_size = config_batch_size;
                     let col_size = (batch_size / (row_size as u64)) as usize;
                     
                     let row_in = unsafe { opencl3::memory::Buffer::<u32>::create(&context, opencl3::memory::CL_MEM_READ_ONLY, row_size * 16, std::ptr::null_mut()).unwrap() };
@@ -565,7 +571,7 @@ fn main() {
         progress_counter.store(0, Ordering::Relaxed);
 
         if let Some((_, ref queue, ref kernel_add, ref kernel_invert, ref kernel_bloom, ref filter_buffer, ref mut output_buffer, ref mut output_count, ref row_in, ref mut col_in, ref mut points_out, ref mut z_heap, ref secp)) = gpu_context {
-            let gpu_batch_size = 8388608u64;
+            let gpu_batch_size = config_batch_size;
             let mut keys_processed = 0u64;
 
             while keys_processed < count {
