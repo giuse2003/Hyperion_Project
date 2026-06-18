@@ -658,8 +658,8 @@ fn main() {
                     println!("    Nested: {}", derived.nested_addr);
                     println!("    Native: {}", derived.native_addr);
                     
-                    // Se vuoi che il coordinator se ne occupi, potresti scommentare qui:
-                    // let _ = result_tx.send((hit_key, derived.clone(), "legacy".to_string(), 0, 0));
+                    // Invia il risultato al coordinator per salvarlo in risultati.json
+                    let _ = result_tx.send((hit_key, derived.clone(), "gpu_hit".to_string(), 0, 0));
                 }
             }
             progress_counter.store(count, Ordering::Relaxed);
