@@ -11,5 +11,7 @@ echo.
 echo Avvio del worker collegato a: %SERVER_IP%...
 echo.
 
-target\x86_64-pc-windows-gnu\release\hyperion_worker.exe --server %SERVER_IP%
+if "%SERVER_IP:~0,2%"=="\\" set "SERVER_IP=%SERVER_IP:~2%"
+
+target\release\hyperion_worker.exe --server %SERVER_IP%
 pause
