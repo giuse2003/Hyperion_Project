@@ -1,15 +1,15 @@
 # 🧠 Sincronizzazione Agenti AI - Progetto Hyperion
 
-Questo file serve per mantenere il contesto e allineare lo sviluppo del progetto **Hyperion** tra questo PC (Worker) e l'altro PC (Server Coordinator "Lenovo"). Poiché operiamo su macchine separate senza comunicazione diretta, usa questo documento per capire a che punto siamo e in che direzione stiamo lavorando.
+Questo file serve per mantenere il contesto e allineare lo sviluppo del progetto **Hyperion** tra la flotta di **Worker** (PC multipli con GPU diverse, es. NVIDIA o AMD, come desktop-casa-giuse) e il **Server Coordinator** ("Lenovo"). Poiché operiamo su macchine separate senza comunicazione diretta, usa questo documento per capire a che punto siamo e in che direzione stiamo lavorando.
 
 ## 🏗️ Architettura del Progetto
 Il progetto Hyperion è un sistema distribuito per la scansione accelerata tramite GPU di chiavi private Bitcoin, alla ricerca di collisioni (Hits) contro un file *Bloom Filter* (`filter.bin`).
 - **Server Coordinator (Python)**: Gira sul server `Lenovo` sulla porta `8085`. Assegna lotti di chiavi (`pending_blocks`), monitora il progresso globale e salva i risultati confermati in `risultati.json`.
-- **Worker (Rust + OpenCL)**: Gira su questo PC (NVIDIA RTX 5070 Ti). Genera chiavi pubbliche sulla scheda video tramite "Grid Method" EC Math, ne fa l'hashing e le confronta in memoria con il Bloom filter a una velocità di ~50 milioni di chiavi/sec.
+- **Worker (Rust + OpenCL)**: Girano su molteplici PC (es. NVIDIA RTX 5070 Ti, AMD su desktop, ecc.). Generano chiavi pubbliche sulla scheda video tramite "Grid Method" EC Math, ne fanno l'hashing e le confrontano in memoria con il Bloom filter.
 
-## ✅ Stato Attuale sul PC Worker
-1. **Compilazione & Toolchain**: Il worker è stato compilato con successo su Windows utilizzando il toolchain **MSVC** (Microsoft Visual C++ Build Tools). Sono stati generati i file locali `OpenCL.lib` per permettere il linking dinamico alla DLL della scheda video.
-2. **Gestione Memoria GPU (Chunking Engine)**: La scheda video RTX 5070 Ti non può allocare 50M di chiavi in un singolo buffer senza generare `ClError(-61)` (limite driver OpenCL). Per risolvere, ho introdotto un **chunking engine** nel worker: il worker richiede un gigantesco blocco da **50.331.648 chiavi** al Server, ma internamente lo processa sulla GPU in scaglioni ultra-rapidi da **8.388.608 chiavi**.
+## ✅ Stato Attuale dei PC Worker
+1. **Compilazione & Toolchain**: Il worker è compilato in Rust su Windows utilizzando MSVC. Viene sfruttato **OpenCL** per garantire l'astrazione hardware e la compatibilità cross-vendor su tutte le schede (AMD/NVIDIA).
+2. **Gestione Memoria GPU (Chunking Engine)**: Per evitare limiti di allocazione massimi imposti da alcuni driver OpenCL (es. l'errore `ClError(-61)` rilevato su alcune schede), è stato implementato un **chunking engine**: il worker richiede blocchi da oltre **50 milioni di chiavi** al Server, ma poi li processa sulla GPU in "scaglioni" più sicuri e veloci (es. da 8 milioni).
 3. **Segnalazione degli HIT GPU (FIX RECENTE)**: Nel codice originale, quando la GPU trovava un "HIT", lo stampava a terminale ma **non lo inviava al server**. 
    - **Fix apportato**: Il worker ora invia i payload degli hit trovati dalla GPU all'endpoint `/report_match` usando il tag `gpu_hit`.
 
