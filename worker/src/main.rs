@@ -436,7 +436,7 @@ fn main() {
                     let output_count = unsafe { opencl3::memory::Buffer::<u32>::create(&context, opencl3::memory::CL_MEM_READ_WRITE, 1, std::ptr::null_mut()).unwrap() };
                     
                     let row_size = 8192usize;
-                    let batch_size = 50331648u64;
+                    let batch_size = 8388608u64;
                     let col_size = (batch_size / (row_size as u64)) as usize;
                     
                     let row_in = unsafe { opencl3::memory::Buffer::<u32>::create(&context, opencl3::memory::CL_MEM_READ_ONLY, row_size * 16, std::ptr::null_mut()).unwrap() };
@@ -565,102 +565,117 @@ fn main() {
         progress_counter.store(0, Ordering::Relaxed);
 
         if let Some((_, ref queue, ref kernel_add, ref kernel_invert, ref kernel_bloom, ref filter_buffer, ref mut output_buffer, ref mut output_count, ref row_in, ref mut col_in, ref mut points_out, ref mut z_heap, ref secp)) = gpu_context {
-            let start_key_high = (start_key >> 64) as u64;
-            let start_key_low = (start_key & 0xFFFFFFFFFFFFFFFF) as u64;
-            let m_bits = bloom_filter.m as u32;
-            let k_hashes = bloom_filter.k as u32;
-            let max_outputs = 100u32;
-            let zero = [0u32; 1];
-            
-            let col_size = 1024usize;
-            let row_size = 8192usize;
-            let mut col_points = Vec::with_capacity(col_size * 16);
-            for y in 0..col_size {
-                let key = start_key + (y as u128) * (row_size as u128) - 1;
-                let mut priv_bytes = [0u8; 32];
-                let key_bytes = key.to_be_bytes();
-                priv_bytes[16..32].copy_from_slice(&key_bytes);
-                let priv_key = secp256k1::SecretKey::from_slice(&priv_bytes).unwrap();
-                let pub_key = secp256k1::PublicKey::from_secret_key(secp, &priv_key);
-                let serialized = pub_key.serialize_uncompressed();
-                
-                for i in 0..8 {
-                    let ox = 33 - (i + 1) * 4;
-                    col_points.push(((serialized[ox] as u32) << 24) | ((serialized[ox+1] as u32) << 16) | ((serialized[ox+2] as u32) << 8) | (serialized[ox+3] as u32));
+            let gpu_batch_size = 8388608u64;
+            let mut keys_processed = 0u64;
+
+            while keys_processed < count {
+                if !keep_running.load(Ordering::Relaxed) {
+                    break;
                 }
-                for i in 0..8 {
-                    let oy = 65 - (i + 1) * 4;
-                    col_points.push(((serialized[oy] as u32) << 24) | ((serialized[oy+1] as u32) << 16) | ((serialized[oy+2] as u32) << 8) | (serialized[oy+3] as u32));
-                }
-            }
-            
-            let mut hits_count = [0u32; 1];
-            unsafe {
-                queue.enqueue_write_buffer(output_count, opencl3::command_queue::CL_BLOCKING, 0, &zero, &[]).unwrap();
-                queue.enqueue_write_buffer(col_in, opencl3::command_queue::CL_BLOCKING, 0, &col_points, &[]).unwrap();
+
+                let current_batch_size = std::cmp::min(gpu_batch_size, count - keys_processed);
+                let current_start_key = start_key + keys_processed as u128;
+
+                let start_key_high = (current_start_key >> 64) as u64;
+                let start_key_low = (current_start_key & 0xFFFFFFFFFFFFFFFF) as u64;
+                let m_bits = bloom_filter.m as u32;
+                let k_hashes = bloom_filter.k as u32;
+                let max_outputs = 100u32;
+                let zero = [0u32; 1];
                 
-                use opencl3::kernel::ExecuteKernel;
-                ExecuteKernel::new(kernel_add)
-                    .set_arg(points_out)
-                    .set_arg(z_heap)
-                    .set_arg(row_in)
-                    .set_arg(col_in)
-                    .set_global_work_sizes(&[row_size, col_size])
-                    .set_local_work_sizes(&[64, 1])
-                    .enqueue_nd_range(queue).unwrap();
+                let col_size = ((current_batch_size + 8191) / 8192) as usize;
+                let row_size = 8192usize;
+                let mut col_points = Vec::with_capacity(col_size * 16);
+                for y in 0..col_size {
+                    let mut key = current_start_key + (y as u128) * (row_size as u128) - 1;
+                    if key == 0 {
+                        key = 1;
+                    }
+                    let mut priv_bytes = [0u8; 32];
+                    let key_bytes = key.to_be_bytes();
+                    priv_bytes[16..32].copy_from_slice(&key_bytes);
+                    let priv_key = secp256k1::SecretKey::from_slice(&priv_bytes).unwrap();
+                    let pub_key = secp256k1::PublicKey::from_secret_key(secp, &priv_key);
+                    let serialized = pub_key.serialize_uncompressed();
                     
-                let invsize = 256i32;
-                let invws = (50331648usize / (invsize as usize)) as usize;
-                ExecuteKernel::new(kernel_invert)
-                    .set_arg(z_heap)
-                    .set_arg(&invsize)
-                    .set_global_work_size(invws)
-                    .set_local_work_size(64)
-                    .enqueue_nd_range(queue).unwrap();
-                    
-                ExecuteKernel::new(kernel_bloom)
-                    .set_arg(output_buffer)
-                    .set_arg(output_count)
-                    .set_arg(points_out)
-                    .set_arg(z_heap)
-                    .set_arg(filter_buffer)
-                    .set_arg(&m_bits)
-                    .set_arg(&k_hashes)
-                    .set_arg(&max_outputs)
-                    .set_arg(&start_key_high)
-                    .set_arg(&start_key_low)
-                    .set_global_work_sizes(&[row_size, col_size])
-                    .set_local_work_sizes(&[64, 1])
-                    .enqueue_nd_range(queue).unwrap();
-                    
-                queue.finish().unwrap();
-                
-                queue.enqueue_read_buffer(output_count, opencl3::command_queue::CL_BLOCKING, 0, &mut hits_count, &[]).unwrap();
-            }
-            
-            if hits_count[0] > 0 {
-                let mut hits = vec![0u64; (hits_count[0] * 2) as usize];
-                unsafe { queue.enqueue_read_buffer(output_buffer, opencl3::command_queue::CL_BLOCKING, 0, &mut hits, &[]).unwrap(); }
-                for i in 0..hits_count[0] {
-                    let hit_high = hits[(i * 2) as usize];
-                    let hit_low = hits[(i * 2 + 1) as usize];
-                    let hit_key = ((hit_high as u128) << 64) | (hit_low as u128);
-                    println!("=======================================================");
-                    println!("!!! HIT GPU RILEVATO DALLA SCHEDA VIDEO !!!");
-                    println!("Chiave Privata possibilmente valida: #{}", hit_key);
-                    println!("=======================================================");
-                    // La CPU si occuperà di verificare questa specifica chiave derivandola a mano
-                    // Abbiamo un "hit" del Bloom Filter dalla GPU.
-                    // Evitiamo di fare 3 richieste HTTP bloccanti per ogni falso positivo,
-                    // altrimenti la CPU frena la GPU. Stampiamo solo gli indirizzi generati:
-                    let derived = derive_addresses(&secp, hit_key);
-                    println!("    Legacy: {}", derived.legacy_addr);
-                    println!("    Nested: {}", derived.nested_addr);
-                    println!("    Native: {}", derived.native_addr);
-                    
-                    // Invia il risultato al coordinator per salvarlo in risultati.json
-                    let _ = result_tx.send((hit_key, derived.clone(), "gpu_hit".to_string(), 0, 0));
+                    for i in 0..8 {
+                        let ox = 33 - (i + 1) * 4;
+                        col_points.push(((serialized[ox] as u32) << 24) | ((serialized[ox+1] as u32) << 16) | ((serialized[ox+2] as u32) << 8) | (serialized[ox+3] as u32));
+                    }
+                    for i in 0..8 {
+                        let oy = 65 - (i + 1) * 4;
+                        col_points.push(((serialized[oy] as u32) << 24) | ((serialized[oy+1] as u32) << 16) | ((serialized[oy+2] as u32) << 8) | (serialized[oy+3] as u32));
+                    }
                 }
+                
+                let mut hits_count = [0u32; 1];
+                unsafe {
+                    queue.enqueue_write_buffer(output_count, opencl3::command_queue::CL_BLOCKING, 0, &zero, &[]).unwrap();
+                    queue.enqueue_write_buffer(col_in, opencl3::command_queue::CL_BLOCKING, 0, &col_points, &[]).unwrap();
+                    
+                    use opencl3::kernel::ExecuteKernel;
+                    ExecuteKernel::new(kernel_add)
+                        .set_arg(points_out)
+                        .set_arg(z_heap)
+                        .set_arg(row_in)
+                        .set_arg(col_in)
+                        .set_global_work_sizes(&[row_size, col_size])
+                        .set_local_work_sizes(&[64, 1])
+                        .enqueue_nd_range(queue).unwrap();
+                        
+                    let invsize = 256i32;
+                    let invws = ((col_size * row_size) / (invsize as usize)) as usize;
+                    ExecuteKernel::new(kernel_invert)
+                        .set_arg(z_heap)
+                        .set_arg(&invsize)
+                        .set_global_work_size(invws)
+                        .set_local_work_size(64)
+                        .enqueue_nd_range(queue).unwrap();
+                        
+                    ExecuteKernel::new(kernel_bloom)
+                        .set_arg(output_buffer)
+                        .set_arg(output_count)
+                        .set_arg(points_out)
+                        .set_arg(z_heap)
+                        .set_arg(filter_buffer)
+                        .set_arg(&m_bits)
+                        .set_arg(&k_hashes)
+                        .set_arg(&max_outputs)
+                        .set_arg(&start_key_high)
+                        .set_arg(&start_key_low)
+                        .set_global_work_sizes(&[row_size, col_size])
+                        .set_local_work_sizes(&[64, 1])
+                        .enqueue_nd_range(queue).unwrap();
+                        
+                    queue.finish().unwrap();
+                    
+                    queue.enqueue_read_buffer(output_count, opencl3::command_queue::CL_BLOCKING, 0, &mut hits_count, &[]).unwrap();
+                }
+                
+                if hits_count[0] > 0 {
+                    let mut hits = vec![0u64; (hits_count[0] * 2) as usize];
+                    unsafe { queue.enqueue_read_buffer(output_buffer, opencl3::command_queue::CL_BLOCKING, 0, &mut hits, &[]).unwrap(); }
+                    for i in 0..hits_count[0] {
+                        let hit_high = hits[(i * 2) as usize];
+                        let hit_low = hits[(i * 2 + 1) as usize];
+                        let hit_key = ((hit_high as u128) << 64) | (hit_low as u128);
+                        println!("=======================================================");
+                        println!("!!! HIT GPU RILEVATO DALLA SCHEDA VIDEO !!!");
+                        println!("Chiave Privata possibilmente valida: #{}", hit_key);
+                        println!("=======================================================");
+                        let derived = derive_addresses(&secp, hit_key);
+                        println!("    Legacy: {}", derived.legacy_addr);
+                        println!("    Nested: {}", derived.nested_addr);
+                        println!("    Native: {}", derived.native_addr);
+                        
+                        // Invia il risultato al coordinator per salvarlo in risultati.json
+                        let _ = result_tx.send((hit_key, derived.clone(), "gpu_hit".to_string(), 0, 0));
+                    }
+                }
+                keys_processed += current_batch_size;
+                let elapsed = start_time.elapsed().as_secs_f64();
+                let speed = (keys_processed as f64) / elapsed;
+                println!("[Stats] Processate {}/{} chiavi nel blocco attuale. Velocità media: {:.0} chiavi/sec", keys_processed, count, speed);
             }
             progress_counter.store(count, Ordering::Relaxed);
         } else {
@@ -687,14 +702,17 @@ fn main() {
         while keep_running.load(Ordering::Relaxed) {
             // Controlla se i thread hanno trovato una chiave con saldo reale
             if let Ok((found_key, derived, addr_type, balance, txs)) = result_rx.recv_timeout(check_interval) {
-                // Abbiamo trovato qualcosa!
-                println!("\n=======================================================");
-                println!("!!! HIT CONFERMATO ONLINE !!!");
-                println!("Chiave Privata: #{}", found_key);
-                println!("WIF: {}", derived.wif);
-                println!("Tipo indirizzo: {}", addr_type);
-                println!("Saldo: {} satoshi (Txs: {})", balance, txs);
-                println!("=======================================================");
+                if addr_type == "gpu_hit" {
+                    println!("=> Inoltro collisione Bloom Filter al Server per la chiave #{}", found_key);
+                } else {
+                    println!("\n=======================================================");
+                    println!("!!! HIT CONFERMATO ONLINE !!!");
+                    println!("Chiave Privata: #{}", found_key);
+                    println!("WIF: {}", derived.wif);
+                    println!("Tipo indirizzo: {}", addr_type);
+                    println!("Saldo: {} satoshi (Txs: {})", balance, txs);
+                    println!("=======================================================");
+                }
 
                 // Genera report JSON
                 let mut addresses = std::collections::HashMap::new();
@@ -731,8 +749,10 @@ fn main() {
                 let report_url = format!("{}/report_match", coordinator_url);
                 let _ = ureq::post(&report_url).send_json(&report);
                 
-                keep_running.store(false, Ordering::Relaxed);
-                break;
+                if addr_type != "gpu_hit" {
+                    keep_running.store(false, Ordering::Relaxed);
+                    break;
+                }
             }
 
             // Verifica se tutto il blocco è stato scansionato dai thread
